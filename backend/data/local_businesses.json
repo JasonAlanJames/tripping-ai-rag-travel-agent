@@ -1,0 +1,47 @@
+[
+  {
+    "name": "Corona Heritage Park and Museum",
+    "category": "entertainment",
+    "address": "510 W Foothill Pkwy, Corona, CA 92882",
+    "city": "Corona",
+    "state": "CA",
+    "description": "A local historical park and museum featuring restored buildings, community history, and family-friendly exhibits.",
+    "notes": "Good for a relaxed daytime stop."
+  },
+  {
+    "name": "The Shops at Dos Lagos",
+    "category": "shopping and entertainment",
+    "address": "2780 Cabot Dr, Corona, CA 92883",
+    "city": "Corona",
+    "state": "CA",
+    "description": "Outdoor shopping, dining, and entertainment destination in Corona.",
+    "notes": "Useful for food, walking, casual shopping, and evening plans."
+  },
+  {
+    "name": "Riverside Food Lab",
+    "category": "food",
+    "address": "3605 Market St, Riverside, CA 92501",
+    "city": "Riverside",
+    "state": "CA",
+    "description": "A food hall in downtown Riverside with multiple dining options.",
+    "notes": "Good for groups or travelers who want several food choices in one location."
+  },
+  {
+    "name": "Mission Inn Hotel and Spa",
+    "category": "historic landmark and entertainment",
+    "address": "3649 Mission Inn Ave, Riverside, CA 92501",
+    "city": "Riverside",
+    "state": "CA",
+    "description": "Historic Riverside landmark known for architecture, dining, tours, and downtown walkability.",
+    "notes": "Strong anchor stop for a Riverside itinerary."
+  },
+  {
+    "name": "California Citrus State Historic Park",
+    "category": "entertainment",
+    "address": "9400 Dufferin Ave, Riverside, CA 92503",
+    "city": "Riverside",
+    "state": "CA",
+    "description": "A historic state park focused on California citrus history, walking areas, and educational exhibits.",
+    "notes": "Good daytime cultural and outdoor stop."
+  }
+]
