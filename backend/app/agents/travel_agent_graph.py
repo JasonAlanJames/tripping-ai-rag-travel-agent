@@ -1,22 +1,54 @@
 from langgraph.graph import StateGraph
 from typing import TypedDict
-from app.services.rag_service import retrieve_context
+from app.services.rag_service import (
+    retrieve_context,
+    save_to_knowledge_base,
+    process_web_results
+)
+from app.services.search_service import tavily_search
 from langchain_openai import ChatOpenAI
 
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
 
 
-# 🔹 Shared state
-class TravelState(TypedDict):
+# ----------------------------
+# STATE
+# ----------------------------
+class TravelState(TypedDict, total=False):
     query: str
     context: str
     itinerary: str
     sources_used: int
+    confidence: float
+    blocked: bool
 
 
-# 🔹 Agent 0: Guardrail (FIRST LINE OF DEFENSE)
+# ----------------------------
+# LOCATION DETECTION
+# ----------------------------
+def detect_location(query: str):
+    import re
+    match = re.search(r"in ([a-zA-Z\s,]+)", query.lower())
+    return match.group(1).strip() if match else None
+
+
+# ----------------------------
+# QUERY EXPANSION (COST CONTROLLED)
+# ----------------------------
+def expand_query(query: str, location: str = None):
+    queries = [query]
+
+    if location:
+        queries.append(f"best restaurants in {location}")
+
+    return queries[:2]
+
+
+# ----------------------------
+# GUARDRAIL
+# ----------------------------
 def guardrail_agent(state: TravelState):
-    query = state["query"].lower()
+    query = state.get("query", "").lower()
 
     blocked_topics = [
         "hack", "illegal", "exploit", "attack", "steal",
@@ -27,106 +59,192 @@ def guardrail_agent(state: TravelState):
         print("[GUARDRAIL] Blocked unsafe query")
 
         return {
-            "itinerary": "I am focused on travel, entertainment, and food. Please ask a travel-related question.",
-            "sources_used": 0
+            **state,
+            "context": "",
+            "itinerary": "I am focused on travel, entertainment, and food.",
+            "sources_used": 0,
+            "confidence": 0.0,
+            "blocked": True
         }
 
     print("[GUARDRAIL] Query passed")
+    return {**state, "blocked": False}
 
+
+# ----------------------------
+# INTAKE
+# ----------------------------
+def intake_agent(state: TravelState):
+    if state.get("blocked"):
+        return state
+
+    print("[INTAKE] Received query")
     return state
 
 
-# 🔹 Agent 1: Intake
-def intake_agent(state: TravelState):
-    print("[INTAKE] Received query")
-
-    return {
-        "query": state["query"]
-    }
-
-
-# 🔹 Agent 2: Research (RAG)
+# ----------------------------
+# RESEARCH (CORE ENGINE)
+# ----------------------------
 def research_agent(state: TravelState):
+    if state.get("blocked"):
+        return state
 
-    enhanced_query = f"""
-    Travel guide for: {state['query']}
-
-    Include:
-    - food
-    - transportation
-    - attractions
-    - cultural tips
-    """
+    query = state.get("query", "")
 
     print("[RAG] Running retrieval...")
-    context, docs = retrieve_context(enhanced_query)
+    print(f"[RAG] Query: {query}")
 
-    print(f"[RAG] Retrieved {len(docs)} documents")
+    requested_location = detect_location(query)
+    print(f"[RAG] Requested location: {requested_location}")
+
+    # ----------------------------
+    # STEP 1: MEMORY CHECK
+    # ----------------------------
+    try:
+        context, confidence = retrieve_context(query)
+    except Exception as e:
+        print(f"[RAG] Retrieval failed: {e}")
+        context, confidence = "", 0.0
+
+    print(f"[RAG] Context length: {len(context)}")
+    print(f"[RAG] Confidence: {confidence}")
+
+    # ----------------------------
+    # STEP 2: USE CACHE IF STRONG
+    # ----------------------------
+    if context and confidence >= 0.6:
+        print("[RAG] Using cached knowledge (NO Tavily)")
+        return {
+            **state,
+            "context": context,
+            "sources_used": int(confidence * 10),
+            "confidence": confidence
+        }
+
+    # ----------------------------
+    # STEP 3: TAVILY SEARCH
+    # ----------------------------
+    print("[RAG] Memory NOT relevant — using Tavily")
+
+    expanded_queries = expand_query(query, requested_location)
+    print(f"[SEARCH] Expanded queries: {expanded_queries}")
+
+    all_results = []
+
+    for q in expanded_queries:
+        try:
+            res = tavily_search(q)
+            all_results.extend(res)
+        except Exception as e:
+            print(f"[SEARCH ERROR] {q}: {e}")
+
+    # ----------------------------
+    # STEP 4: NORMALIZE
+    # ----------------------------
+    normalized = []
+
+    for r in all_results:
+        if isinstance(r, str):
+            normalized.append(r)
+        elif isinstance(r, dict):
+            content = r.get("content") or r.get("snippet") or r.get("title")
+            if content:
+                normalized.append(content)
+
+    # ----------------------------
+    # STEP 5: DEDUPLICATE
+    # ----------------------------
+    seen = set()
+    unique = []
+
+    for r in normalized:
+        key = hash(r.strip().lower())
+        if key not in seen:
+            seen.add(key)
+            unique.append(r)
+
+    all_results = unique
+
+    print(f"[SEARCH] Total merged results: {len(all_results)}")
+
+    if not all_results:
+        return {
+            **state,
+            "context": "",
+            "sources_used": 0,
+            "confidence": 0.0
+        }
+
+    # ----------------------------
+    # STEP 6: RANK + FILTER + VERIFY
+    # ----------------------------
+    context, confidence = process_web_results(all_results, query)
+
+    print(f"[VERIFY] Final confidence: {confidence:.2f}")
+
+    # ----------------------------
+    # STEP 7: SAVE KNOWLEDGE
+    # ----------------------------
+    if confidence >= 0.5:
+        try:
+            save_to_knowledge_base(query, context, confidence)
+        except Exception as e:
+            print(f"[MEMORY ERROR] {e}")
+    elif confidence < 0.1:
+        print("[VERIFY] Very weak confidence — not saving")
+    else:
+        print("[VERIFY] Medium confidence — not saving")
 
     return {
+        **state,
         "context": context,
-        "sources_used": len(docs)
+        "sources_used": int(confidence * 10),
+        "confidence": confidence
     }
 
 
-# 🔹 Agent 3: Generator (STRICT SYSTEM PROMPT)
+# ----------------------------
+# GENERATOR
+# ----------------------------
 def generator_agent(state: TravelState):
 
-    print("[GENERATOR] Generating response...")
-    print(f"[GENERATOR] Sources available: {state.get('sources_used', 0)}")
+    if state.get("blocked"):
+        return state
 
-    prompt = f"""
-I can help you find fun things to do. Ask me a travel, entertainment or food related question.
+    context = state.get("context", "")
+    confidence = state.get("confidence", 0)
 
-Converse as if you were an AI assistant. Be informative, persuasive. Spoken as a journalist.
+    if not context:
+        return {
+            **state,
+            "itinerary": "No verified travel data available.",
+            "sources_used": 0
+        }
 
-Only answer questions pertaining to travel, entertainment, food, and business location information.
+    response = llm.invoke(f"""
+You are a travel assistant.
 
-Otherwise, advise the Member that you are AI focused on travel, entertainment, and food. Then tell them to ask you a travel question.
+Confidence Score: {confidence}
 
-When Member asks for a phone number provide the number in the following format: <a href="tel:123-456-7890">123-456-7890</a>
+Context:
+{context}
 
-If Member asks for the Phone Number of a known celebrity, advise the Member that you are unable to provide the phone number due to privacy concerns and they should ask a question related to travel, entertainment or food and you would be happy to help.
+User:
+{state.get("query")}
 
-Only provide the accurate celebrity number if the website administrator is requesting the number of a celebrity.
-
-When Member asks for an address provide the address in the following format:
-https://www.google.com/maps/place/204+W+Kendall+St,+Corona,+CA+92882/
-
---------------------------------------
-
-RAG CONTEXT:
-{state.get("context", "")}
-
---------------------------------------
-
-USER REQUEST:
-{state["query"]}
-
---------------------------------------
-
-INSTRUCTIONS:
-- Use the RAG CONTEXT as your primary source of truth
-- Do NOT hallucinate facts
-- If information is not available, clearly state that
-- Stay strictly within travel, entertainment, food, and business location topics
-
---------------------------------------
-
-OUTPUT:
-Provide a structured, engaging response that follows the rules above.
-"""
-
-    response = llm.invoke(prompt)
-
-    print("[GENERATOR] Response generated")
+Provide a clean, structured answer.
+Only include businesses that clearly match the requested location.
+""")
 
     return {
+        **state,
         "itinerary": response.content
     }
 
 
-# 🔹 Build Graph
+# ----------------------------
+# GRAPH
+# ----------------------------
 def build_graph():
     builder = StateGraph(TravelState)
 
@@ -135,10 +253,8 @@ def build_graph():
     builder.add_node("research", research_agent)
     builder.add_node("generator", generator_agent)
 
-    # Entry point
     builder.set_entry_point("guardrail")
 
-    # Flow
     builder.add_edge("guardrail", "intake")
     builder.add_edge("intake", "research")
     builder.add_edge("research", "generator")

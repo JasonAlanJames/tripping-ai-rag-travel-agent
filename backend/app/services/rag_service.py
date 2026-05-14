@@ -1,228 +1,422 @@
-import json
+# =========================================================
+# IMPORTS
+# =========================================================
+
 import re
-from pathlib import Path
-from typing import Any
-from urllib.parse import quote_plus
+import time
+from typing import List, Any, Tuple
+
+from langchain_chroma import Chroma
+from langchain_openai import OpenAIEmbeddings
+
+from app.services.search_service import tavily_search
+from app.services.google_places_service import enrich_businesses
 
 
-DATA_FILE = Path(__file__).resolve().parents[2] / "data" / "local_businesses.json"
+# =========================================================
+# VECTOR STORE
+# =========================================================
+
+embedding = OpenAIEmbeddings()
+
+vectorstore = Chroma(
+    persist_directory="chroma_db",
+    embedding_function=embedding
+)
 
 
-def load_business_data() -> list[dict[str, Any]]:
-    """
-    Load local business/location data from backend/data/local_businesses.json.
+# =========================================================
+# CACHE
+# =========================================================
 
-    This is the local JSON source of truth for the starter RAG system.
-    """
-    if not DATA_FILE.exists():
-        print(f"[RAG] Data file not found: {DATA_FILE}")
-        return []
+RAG_CACHE = {}
+CACHE_TTL_SECONDS = 3600
+
+
+def is_cache_valid(entry):
+    return time.time() - entry["timestamp"] < CACHE_TTL_SECONDS
+
+
+# =========================================================
+# UTILITIES
+# =========================================================
+
+def extract_location(query: str) -> str:
+    match = re.search(r"in ([a-zA-Z\s,]+)", query.lower())
+    return match.group(1).strip() if match else ""
+
+
+def trim_context(context: str, max_chars: int = 3000) -> str:
+    return context[:max_chars]
+
+
+# =========================================================
+# BUSINESS VALIDATOR
+# =========================================================
+
+def is_valid_business_candidate(name: str) -> bool:
+    if not name:
+        return False
+
+    lower = name.lower().strip()
+
+    blocked = [
+        "county", "city", "california", "about", "share", "link",
+        "menu", "gallery", "directions", "visit", "experience",
+        "best", "top", "cheap"
+    ]
+
+    if any(b in lower for b in blocked):
+        return False
+
+    generic_exact = [
+        "japanese restaurant",
+        "chinese restaurant",
+        "mexican restaurant",
+        "sushi restaurant",
+        "japanese izakaya",
+        "sushi bar",
+        "sushi bars",
+        "restaurant",
+        "restaurants"
+    ]
+
+    if lower in generic_exact:
+        return False
+
+    generic_phrases = [
+        "food", "places", "locations",
+        "all you can eat"
+    ]
+
+    if any(g in lower for g in generic_phrases):
+        return False
+
+    if "'s" in lower or "yelp" in lower or "linkedin" in lower:
+        return False
+
+    words = name.split()
+
+    if len(words) < 2 or len(words) > 5:
+        return False
+
+    strong_tokens = ["sushi", "kitchen", "grill", "cafe", "ramen"]
+
+    if not any(token in lower for token in strong_tokens):
+        return False
+
+    return True
+
+
+# =========================================================
+# LOCATION VALIDATOR
+# =========================================================
+
+def is_location_relevant(name: str, location: str) -> bool:
+    if not location:
+        return True
+
+    lower = name.lower()
+
+    if location not in lower:
+        other_cities = [
+            "whittier", "long beach", "los angeles",
+            "anaheim", "irvine", "san diego"
+        ]
+
+        if any(city in lower for city in other_cities):
+            return False
+
+    return True
+
+
+# =========================================================
+# RANKING
+# =========================================================
+
+def rank_businesses(businesses: List[dict]) -> List[dict]:
+    def score(b):
+        rating = b.get("rating", 0) or 0
+        name = b.get("name", "").lower()
+        address = b.get("address", "").lower()
+
+        score = rating
+
+        if "sushi" in name:
+            score += 1.5
+
+        if "corona" in address:
+            score += 2
+
+        if name in ["sushi bar", "sushi bars"]:
+            score -= 2
+
+        if not b.get("address"):
+            score -= 1
+        if not b.get("phone"):
+            score -= 0.5
+
+        return score
+
+    ranked = sorted(businesses, key=score, reverse=True)
+
+    seen = set()
+    deduped = []
+
+    for b in ranked:
+        name = b.get("name", "").lower()
+        normalized = re.sub(r'\b(restaurant|sushi|bar)\b', '', name).strip()
+
+        if normalized not in seen:
+            seen.add(normalized)
+            deduped.append(b)
+
+    return deduped
+
+
+# =========================================================
+# ENSURE MINIMUM CANDIDATES
+# =========================================================
+
+def ensure_minimum_candidates(candidates: List[str], query: str, location: str) -> List[str]:
+    if len(candidates) >= 5:
+        return candidates
+
+    print("[RAG] Expanding candidates for coverage")
+
+    fallback_terms = [
+        f"best restaurants in {location}",
+        f"top rated restaurants in {location}",
+        query
+    ]
+
+    expanded = set(candidates)
+
+    for term in fallback_terms:
+        results = tavily_search(term)
+        extra = extract_candidate_names(results)
+
+        for name in extra:
+            if is_valid_business_candidate(name) and is_location_relevant(name, location):
+                expanded.add(name)
+
+        if len(expanded) >= 8:
+            break
+
+    return list(expanded)
+
+
+# =========================================================
+# KNOWLEDGE BASE
+# =========================================================
+
+def is_duplicate(context: str) -> bool:
+    try:
+        docs = vectorstore.similarity_search(context, k=1)
+        if docs and context[:200] in docs[0].page_content:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def save_to_knowledge_base(query: str, context: str, confidence: float):
+    if confidence < 0.6 or is_duplicate(context):
+        return
 
     try:
-        with DATA_FILE.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-
-        if not isinstance(data, list):
-            print("[RAG] Invalid data format. Expected a JSON array.")
-            return []
-
-        print(f"[RAG] Loaded {len(data)} business/location records.")
-        return data
-
-    except json.JSONDecodeError as error:
-        print(f"[RAG] JSON decode error in {DATA_FILE}: {error}")
-        return []
-
-    except OSError as error:
-        print(f"[RAG] File read error for {DATA_FILE}: {error}")
-        return []
+        vectorstore.add_texts([context], metadatas=[{"query": query}])
+        print("[RAG] Knowledge saved")
+    except Exception as e:
+        print(f"[RAG] Save error: {e}")
 
 
-def normalize_text(value: str) -> str:
-    """
-    Normalize text for basic keyword matching.
-    """
-    if not value:
-        return ""
+# =========================================================
+# PROCESS WEB RESULTS
+# =========================================================
 
-    return value.lower().strip()
+def process_web_results(results: List[Any], query: str, location: str):
+    texts = []
 
+    for r in results:
+        text = r.get("content") if isinstance(r, dict) else str(r)
+        texts.append(text)
 
-def tokenize_query(query: str) -> list[str]:
-    """
-    Convert a query string into searchable keyword tokens.
+    context = "\n\n".join(texts)
 
-    Keeps meaningful words and removes short/noisy terms.
-    """
-    normalized_query = normalize_text(query)
+    if not context.strip():
+        return "", 0.0
 
-    tokens = re.findall(r"[a-zA-Z0-9]+", normalized_query)
-
-    stop_words = {
-        "the",
-        "and",
-        "for",
-        "from",
-        "with",
-        "this",
-        "that",
-        "into",
-        "trip",
-        "day",
-        "days",
-        "create",
-        "itinerary",
-        "include",
-        "travel",
-        "budget",
-    }
-
-    return [
-        token
-        for token in tokens
-        if len(token) >= 3 and token not in stop_words
-    ]
+    return trim_context(context), 1.0
 
 
-def address_to_google_maps_link(address: str) -> str:
-    """
-    Convert a human-readable address into the required Google Maps HTML link format.
+# =========================================================
+# NAME EXTRACTION
+# =========================================================
 
-    Example:
-    204 W Kendall St, Corona, CA 92882
+def extract_candidate_names(results: List[Any]) -> List[str]:
+    candidates = set()
 
-    Becomes:
-    <a href="https://www.google.com/maps/place/204+W+Kendall+St+Corona+CA+92882/">204 W Kendall St, Corona, CA 92882</a>
-    """
-    if not address or address == "Not available":
-        return "Not available"
+    pattern = r'\b([A-Z][a-zA-Z&\'\-]+(?:\s+[A-Z][a-zA-Z&\'\-]+){1,4})\b'
 
-    encoded_address = quote_plus(address.replace(",", ""))
+    for r in results:
+        text = str(r)
+        matches = re.findall(pattern, text)
 
-    return (
-        f'<a href="https://www.google.com/maps/place/{encoded_address}/">'
-        f"{address}"
-        f"</a>"
+        for name in matches:
+            candidates.add(name.strip())
+
+    return list(candidates)
+
+
+# =========================================================
+# MAIN PIPELINE
+# =========================================================
+
+def retrieve_context(query: str) -> Tuple[str, float]:
+    print("[RAG] Running retrieval...")
+
+    location = extract_location(query)
+    cache_key = f"{query.lower()}::{location.lower()}"
+
+    print(f"[RAG] Query: {query}")
+    print(f"[RAG] Location: {location}")
+
+    if cache_key in RAG_CACHE:
+        entry = RAG_CACHE[cache_key]
+        if is_cache_valid(entry):
+            print("[RAG] Using cached result")
+            return entry["context"], entry["confidence"]
+        del RAG_CACHE[cache_key]
+
+    try:
+        docs = vectorstore.similarity_search(query, k=3)
+    except Exception:
+        docs = []
+
+    if docs:
+        combined = "\n\n".join([d.page_content for d in docs])
+
+        if location and location in combined.lower():
+            print("[RAG] Using vectorstore (with enrichment)")
+
+            candidates = extract_candidate_names([combined])
+            print(f"[RAG] Raw candidates: {candidates}")
+
+            filtered_candidates = ensure_minimum_candidates(
+                [
+                    c for c in candidates
+                    if is_valid_business_candidate(c)
+                    and is_location_relevant(c, location)
+                ],
+                query,
+                location
+            )
+
+            print(f"[RAG] Filtered candidates: {filtered_candidates}")
+            print(f"[GOOGLE] Enriching: {filtered_candidates[:5]}")
+
+            enriched = enrich_businesses(filtered_candidates[:5], location)
+
+            if enriched:
+                enriched = rank_businesses(enriched)
+
+                lines = ["\nTop verified restaurants:\n"]
+
+                for b in enriched:
+                    line = f"- {b['name']}"
+                    if b.get("rating"):
+                        line += f" (⭐ {b['rating']})"
+                    if b.get("address"):
+                        line += f"\n  Address: {b['address']}"
+                    if b.get("phone"):
+                        line += f"\n  Phone: {b['phone']}"
+                    lines.append(line)
+
+                context = "\n".join(lines)
+                confidence = 0.9
+            else:
+                context = trim_context(combined)
+                confidence = 0.85
+
+            RAG_CACHE[cache_key] = {
+                "context": context,
+                "confidence": confidence,
+                "timestamp": time.time()
+            }
+
+            return context, confidence
+
+    print("[RAG] Running Tavily pipeline")
+
+    from app.agents.travel_agent_graph import expand_query
+
+    all_results = []
+
+    for q in expand_query(query):
+        all_results.extend(tavily_search(q))
+
+    unique_results = list({str(r): r for r in all_results}.values())
+
+    candidates = extract_candidate_names(unique_results)
+    print(f"[RAG] Raw candidates: {candidates}")
+
+    filtered_candidates = ensure_minimum_candidates(
+        [
+            c for c in candidates
+            if is_valid_business_candidate(c)
+            and is_location_relevant(c, location)
+        ],
+        query,
+        location
     )
 
+    print(f"[RAG] Filtered candidates: {filtered_candidates}")
+    print(f"[GOOGLE] Enriching: {filtered_candidates[:5]}")
 
-def build_searchable_text(business: dict[str, Any]) -> str:
-    """
-    Build a searchable text blob from a business/location record.
-    """
-    fields = [
-        business.get("name", ""),
-        business.get("category", ""),
-        business.get("address", ""),
-        business.get("city", ""),
-        business.get("state", ""),
-        business.get("description", ""),
-        business.get("notes", ""),
-    ]
+    enriched = enrich_businesses(filtered_candidates[:5], location)
 
-    return normalize_text(" ".join(str(field) for field in fields if field))
+    if enriched:
+        enriched = rank_businesses(enriched)
 
+        lines = ["\nTop verified restaurants:\n"]
 
-def business_matches_query(business: dict[str, Any], query: str) -> bool:
-    """
-    Basic keyword matcher for starter local JSON RAG.
+        for b in enriched:
+            line = f"- {b['name']}"
+            if b.get("rating"):
+                line += f" (⭐ {b['rating']})"
+            if b.get("address"):
+                line += f"\n  Address: {b['address']}"
+            if b.get("phone"):
+                line += f"\n  Phone: {b['phone']}"
+            lines.append(line)
 
-    This is intentionally simple and transparent. It can later be replaced with
-    Chroma, FAISS, pgvector, or another vector search backend.
-    """
-    query_normalized = normalize_text(query)
-    searchable_text = build_searchable_text(business)
-    query_tokens = tokenize_query(query)
+        context = "\n".join(lines)
+        confidence = 1.0
+    else:
+        context, confidence = process_web_results(unique_results, query, location)
 
-    city = normalize_text(str(business.get("city", "")))
-    state = normalize_text(str(business.get("state", "")))
-    category = normalize_text(str(business.get("category", "")))
-    name = normalize_text(str(business.get("name", "")))
+    save_to_knowledge_base(query, context, confidence)
 
-    if city and city in query_normalized:
-        return True
-
-    if state and state in query_normalized:
-        return True
-
-    if category and category in query_normalized:
-        return True
-
-    if name and name in query_normalized:
-        return True
-
-    return any(token in searchable_text for token in query_tokens)
-
-
-def format_source_record(business: dict[str, Any]) -> dict[str, Any]:
-    """
-    Convert a raw business/location record into a clean structured RAG source.
-    """
-    address = business.get("address", "Not available")
-
-    return {
-        "name": business.get("name", "Not available"),
-        "category": business.get("category", "Not available"),
-        "address": address,
-        "address_link": address_to_google_maps_link(address),
-        "city": business.get("city", "Not available"),
-        "state": business.get("state", "Not available"),
-        "description": business.get("description", "Not available"),
-        "notes": business.get("notes", "Not available"),
+    RAG_CACHE[cache_key] = {
+        "context": context,
+        "confidence": confidence,
+        "timestamp": time.time()
     }
 
-
-def retrieve_sources(query: str, limit: int = 6) -> list[dict[str, Any]]:
-    """
-    Retrieve structured source records from the local business/location dataset.
-    """
-    print(f"[RAG] Retrieval query: {query}")
-
-    businesses = load_business_data()
-
-    if not businesses:
-        print("[RAG] No business/location records available.")
-        return []
-
-    matches = []
-
-    for business in businesses:
-        if business_matches_query(business, query):
-            matches.append(format_source_record(business))
-
-    limited_matches = matches[:limit]
-
-    print(f"[RAG] Matched {len(limited_matches)} source(s).")
-
-    return limited_matches
+    return context, confidence
 
 
-def retrieve_context(query: str) -> str:
-    """
-    Retrieve RAG context as text for the LLM.
+# =========================================================
+# SOURCES
+# =========================================================
 
-    The itinerary LLM should treat this context as the source of truth.
-    """
-    sources = retrieve_sources(query)
+def retrieve_sources(query: str):
+    from app.agents.travel_agent_graph import expand_query
 
-    if not sources:
-        return ""
+    all_results = []
 
-    context_blocks = []
+    for q in expand_query(query):
+        all_results.extend(tavily_search(q))
 
-    for index, item in enumerate(sources, start=1):
-        context_blocks.append(
-            f"""
-SOURCE {index}
-Name: {item["name"]}
-Category: {item["category"]}
-Address: {item["address"]}
-Address Link: {item["address_link"]}
-City: {item["city"]}
-State: {item["state"]}
-Description: {item["description"]}
-Notes: {item["notes"]}
-""".strip()
-        )
-
-    return "\n\n---\n\n".join(context_blocks)
+    return all_results[:5]
