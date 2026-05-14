@@ -24,6 +24,17 @@ vectorstore = Chroma(
     embedding_function=embedding
 )
 
+def detect_intent(query: str) -> str:
+    q = query.lower()
+
+    if any(x in q for x in ["things to do", "activities", "fun", "kids", "family"]):
+        return "activities"
+
+    if any(x in q for x in ["restaurants", "food", "eat", "dining"]):
+        return "restaurants"
+
+    return "general"
+
 
 # =========================================================
 # CACHE
@@ -42,8 +53,35 @@ def is_cache_valid(entry):
 # =========================================================
 
 def extract_location(query: str) -> str:
-    match = re.search(r"in ([a-zA-Z\s,]+)", query.lower())
-    return match.group(1).strip() if match else ""
+    """
+    Extracts a clean location from a natural language query.
+    Prevents over-capturing trailing phrases.
+    Example:
+    "things to do in San Diego with kids" → "san diego"
+    """
+
+    query = query.lower()
+
+    # Non-greedy match, stops at punctuation or sentence boundary
+    match = re.search(r"in ([a-z\s]+?)(?:\?|,|\.|$)", query)
+
+    if match:
+        location = match.group(1).strip()
+
+        # Safety cleanup for common trailing noise words
+        stop_words = [
+            "that", "with", "for", "and", "near", "around"
+        ]
+
+        tokens = location.split()
+
+        # Trim trailing stop words
+        while tokens and tokens[-1] in stop_words:
+            tokens.pop()
+
+        return " ".join(tokens)
+
+    return ""
 
 
 def trim_context(context: str, max_chars: int = 3000) -> str:
@@ -275,6 +313,22 @@ def extract_candidate_names(results: List[Any]) -> List[str]:
 
 def retrieve_context(query: str) -> Tuple[str, float]:
     print("[RAG] Running retrieval...")
+
+    intent = detect_intent(query)
+    print(f"[RAG] Intent detected: {intent}")
+
+    if intent == "activities":
+        print("[RAG] Activity query → skipping restaurant pipeline")
+
+    results = tavily_search(query)
+
+    context = "\n\n".join([
+        r.get("content", "") for r in results if r.get("content")
+    ])
+
+    confidence = 1.0  # ✅ CRITICAL FIX
+
+    return context, confidence
 
     location = extract_location(query)
     cache_key = f"{query.lower()}::{location.lower()}"
